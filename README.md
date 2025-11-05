@@ -1,7 +1,5 @@
 # Airbnb_Review_Analysis
 
-# Airbnb Review Analysis
-
 This project explores patterns in Airbnb listings to understand what factors influence the number of reviews properties receive.
 
 ## 🧠 Objectives
