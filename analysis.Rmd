@@ -1,0 +1,611 @@
+---
+title: "AirBnB - Review Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+Set-Up libraries and data loading.
+
+```{r setup, echo=TRUE, include=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(xray)
+library(dplyr)
+library(dlookr)
+library(stringr)
+data<-read_csv("airbnb_listings.csv")
+data<-as_tibble(data)
+```
+
+Extracting meta-data from the name column.
+
+```{r, echo=TRUE, include=TRUE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(stringr)
+library(purrr)
+library(tidyr)
+
+
+# --- Split the name column into variable-length lists
+data <- data %>%
+  mutate(name = as.character(name),
+         name_parts = str_split(name, "·"))
+
+# --- Function to parse a single row (one list of parts)
+parse_name_parts <- function(parts) {
+  # Clean and drop empty
+  parts <- str_trim(parts)
+  parts <- parts[parts != "" & !is.na(parts)]
+  
+  # Defaults
+  property_type <- location <- NA_character_
+  bedrooms <- beds <- baths <- rating <- NA_real_
+  bath_type <- "unspecified"
+  is_studio <- FALSE
+  
+  # Loop over pieces
+  for (p in parts) {
+    # --- Property type and location
+    if (str_detect(p, regex("\\s+in\\s+", ignore_case = TRUE))) {
+      split_in <- str_split_fixed(p, regex("\\s+in\\s+", ignore_case = TRUE), 2)
+      property_type <- str_squish(split_in[1])
+      location <- str_squish(split_in[2])
+    }
+    
+    # --- ⭐ Rating
+    if (str_detect(p, "★")) {
+      num <- str_extract(p, "[0-9]+\\.?[0-9]*")
+      if (!is.na(num)) rating <- as.numeric(num)
+    }
+    
+    # --- Studio
+    if (str_detect(p, regex("\\bstudio\\b", ignore_case = TRUE))) {
+      is_studio <- TRUE
+      bedrooms <- 0  # or NA if you prefer
+    }
+    
+    # --- Bedrooms
+    if (str_detect(p, regex("bedroom", ignore_case = TRUE))) {
+      num <- str_extract(p, "[0-9]+")
+      if (!is.na(num)) bedrooms <- as.numeric(num)
+    }
+    
+    # --- Beds
+    if (str_detect(p, regex("\\b\\d+\\s*beds?\\b", ignore_case = TRUE))) {
+      num <- str_extract(p, "[0-9]+")
+      if (!is.na(num)) beds <- as.numeric(num)
+    }
+    
+    # --- Baths
+    if (str_detect(p, regex("bath", ignore_case = TRUE))) {
+      # Numeric baths (1, 1.5, etc.)
+      num <- str_extract(p, "[0-9]+\\.?[0-9]*")
+      if (!is.na(num)) {
+        baths <- as.numeric(num)
+      } else if (str_detect(p, regex("half", ignore_case = TRUE))) {
+        baths <- 0.5
+      }
+      
+      # Bath type (shared/private/ensuite/half/full)
+      bt <- str_extract(p, regex("\\b(shared|private|ensuite|half|full)\\b", ignore_case = TRUE))
+      if (!is.na(bt)) bath_type <- tolower(bt)
+    }
+  }
+  
+  # Return as tibble
+  tibble(
+    property_type = property_type,
+    location = location,
+    rating = rating,
+    bedrooms = bedrooms,
+    beds = beds,
+    baths = baths,
+    bath_type = bath_type,
+    is_studio = is_studio
+  )
+}
+
+# --- Apply the function row by row
+parsed_data <- map_dfr(data$name_parts, parse_name_parts)
+
+# --- Combine parsed columns back with original data
+data <- bind_cols(data, parsed_data)
+
+# Remove helper column
+data <- select(data, -name_parts)
+
+```
+
+
+### Question 1. Examine data set structure in R to identify any problems with Airbnb data set.
+##### Describe any data problems you’ve discovered and provide analysis in R Assessment Notebook.
+##### Fix any problems you’ve identified with the data set. Code your solution in R Assessment Notebook. Justify your data cleaning decisions.
+
+*Those 2 parts will be answered together. Upon finding the issues, they will also be resolved. *
+
+
+We can have a quick overlook of the data by running `anomalies()` on our data, but first we will filter out duplicate data and data without name :
+
+
+```{r, echo=TRUE, include=TRUE, message=FALSE, warning=FALSE}
+data<-distinct(data) %>% 
+  filter(!is.na(name))
+xray::anomalies(data)
+```
+
+
+
+
+The `license` column contains mostly missing values, so we can remove entirely. Something similar occurs  with `neighbourhood_group`, where over 90% of values are either missing or zero. Although the `number_of_reviews_ltm` variable has around 53% missing or zero values, it will be retained for analysis, as it may provide insight into differences between listings that have received reviews in the past 12 months and those that have not. It is also possible that this variable correlates with the overall rating of a listing.
+
+The `longitude` and `latitude` columns are not relevant to the current analysis, as our focus is not on spatial factors such as distance from the city center (although these could be important in other contexts). The `id` column serves only as a unique identifier and will also be excluded.
+
+The `availability_365` variable represents the number of days a listing is available over the next year. While it might show a negative correlation with `rating`, it is unlikely to be useful for improving ratings, since high availability often reflects demand and booking patterns rather than quality. Manipulating availability to influence perception would also be ethically questionable. Lastly, `last_review` will be excluded, as it is unlikely to affect other variables directly, though in theory, more recent reviews could make a listing appear more “active” or trustworthy to potential guests.
+
+
+
+```{r, echo=FALSE, include=TRUE, message=FALSE, warning=FALSE}
+data<-select(data,  -c(2, 4:9, 14, 16,17, 19))
+
+```
+
+We noticed that some listings have missing values in the room_type column.
+
+```{r, echo=FALSE, include=TRUE, message=FALSE, warning=FALSE}
+data %>%
+filter(is.na(room_type)) %>%
+count(city)
+```
+It appears that all room types from Manchester are missing, along with a few from other cities.
+This will be important to keep in mind for later analyses, as the absence of room type information may bias comparisons involving Manchester listings.
+
+**Validating Ratings and Filtering Missing Data**
+
+According to Airbnb’s documentation, a listing receives a visible rating only after it has received at least three reviews.
+Upon inspection, a few listings have missing ratings even though they meet this condition (i.e., three or more reviews), while other are simply noted as new.
+These cases may indicate data inconsistencies and will be treated as unreliable.
+Conversely, no listings with fewer than three reviews were found to have a rating, suggesting this rule generally holds true.
+
+
+```{r, echo=FALSE, include=TRUE}
+data<- data %>% 
+  filter(!(is.na(rating) & number_of_reviews>3))
+```
+
+
+**Handling Missing Review Counts**
+
+Since this analysis focuses on understanding the factors influencing the number of reviews, listings without review information cannot contribute meaningful insights.
+Therefore, we will remove entries where the number_of_reviews field is missing.
+This step reduces the dataset by approximately 4,400 listings.
+
+```{r, echo=FALSE, include=TRUE}
+data<-drop_na(data, number_of_reviews)
+```
+
+
+**Filtering for Common Property Types and Reasonable Prices**
+
+To ensure our analysis focuses on representative property types, we first examine how frequently each property type appears in the dataset.
+
+```{r, echo=FALSE, include=TRUE}
+p_types_counts<-data %>% 
+     group_by(property_type) %>% 
+     summarise(count= n()) %>% 
+     arrange(desc(count)) 
+     
+```
+
+
+
+Only property types with at least 500 listings will be retained for analysis.
+This threshold helps exclude rare or irregular listing types that might introduce noise or bias.
+Additionally, since all listings are assumed to accommodate at least one person, we review cases with zero or missing beds.
+For listings identified as studios, missing bed counts are set to one, as studios typically include a single sleeping area.
+To focus on reasonably priced listings, we calculate a price-to-bed ratio and exclude listings exceeding £500 per bed per night, representing high-end outliers that may not reflect typical Airbnb market trends.
+
+
+```{r, echo=FALSE, include=TRUE}
+p_types_counts_500<- p_types_counts %>% 
+  filter(count>=500) 
+  
+common_types<-as.vector(p_types_counts_500$property_type)
+  
+data<-data %>% 
+  filter(property_type %in% common_types)
+
+data <- data %>%
+  mutate(beds = if_else(grepl("Studio", name) & is.na(beds), 1, beds)) %>% 
+  select(-is_studio) #now that we have used the is_studio to complete the number of beds, the column is no longer #needed
+
+data<-mutate(data, price_to_beds=price/beds) %>% 
+  filter(price_to_beds<=500)
+
+```
+
+
+
+
+
+
+
+
+### Question 2. Run exploratory analysis in R on Airbnb dataset.
+
+##### a. Explore the variation in trends between cities in the context of other variables in the data set using visual analytics. Use at least four different types of graphs. Briefly explain why you've selected each of those graphs for specific variables.
+
+
+It is useful to start by exploring how listings are distributed across different cities. A pie chart clearly shows proportional differences between locations and provides context for subsequent comparisons.
+
+```{r, echo=FALSE, include=TRUE}
+# Count listings per city
+city_counts <- table(data$city)
+
+# Calculate percentages
+percentages <- round(100 * city_counts / sum(city_counts), 1)
+labels <- paste0(names(city_counts), " (", percentages, "%)")
+
+# Pie chart
+pie(
+  city_counts,
+  labels = labels,
+  col = rainbow(length(city_counts)),
+  main = "Distribution of Listings by Cities"
+)
+
+```
+
+This visualization highlights which cities dominate the Airbnb market and where listing density is lower, helping establish a baseline for city-level comparisons.
+
+The boxplot below visualizes the variation in listing prices across different cities.
+This type of plot is particularly useful for showing median prices, interquartile ranges, and potential outliers, helping to identify which cities tend to have higher or lower listing prices.
+
+```{r, echo=FALSE, include=TRUE, message=FALSE, warning=FALSE}
+ggplot(data, aes(x = city, y = price, fill = city)) +
+  geom_boxplot(outlier.shape = NA) +
+  coord_cartesian(ylim = c(0, 500))+
+  stat_summary(fun=mean,geom="crossbar", width=0.65, linetype="dashed")+
+  labs(
+    title = "Price Distribution by City",
+    x = element_blank(),
+    y = "Price (£)"
+  ) +
+  theme_minimal()
+```
+From this visualization, we can observe how prices vary between cities.
+The dashed lines represent mean prices, allowing for quick comparison of average costs across locations.
+
+A grouped bar chart is a strong choice for comparing average prices across both room types and cities. It helps reveal differences in pricing structures and which room types are most expensive or affordable within each city.
+
+
+```{r, echo=FALSE, include=TRUE}
+data %>% 
+  group_by(city, room_type) %>% 
+  summarise(avg_price = mean(price, na.rm = TRUE)) %>% 
+  ggplot(aes(x=room_type, y = avg_price, fill = city)) +
+  geom_col(position = "dodge")+
+  labs(
+    title = "Average price by Room Type and City",
+    x = "Room Type",
+    y = "Price"
+  )+
+  theme_classic()
+
+```
+
+From this visualization, we can see that shared and private rooms tend to be the most affordable options,
+while entire homes/apartments and hotel rooms generally have higher average prices, likely due to additional amenities or space.
+
+
+A faceted bar chart is useful here because it lets us compare neighbourhood-level performance within each city, showing both average ratings and popularity (total reviews). Faceting helps prevent overcrowding while keeping city-level context visible.
+
+
+```{r, echo=FALSE, include=TRUE}
+# Summarize data by city and neighbourhood
+rating_summary <- data %>%
+  group_by(city, location) %>%
+  summarise(
+    avg_rating = mean(rating, na.rm = TRUE),
+    total_reviews = sum(number_of_reviews, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Select top 10 neighbourhoods by total reviews within each city
+top_neighbourhoods <- rating_summary %>%
+  group_by(city) %>%
+  slice_max(order_by = total_reviews, n = 10, with_ties = FALSE) %>%
+  ungroup()
+
+# Plot
+ggplot(top_neighbourhoods, aes(x = reorder(location, avg_rating), y = avg_rating, fill = total_reviews)) +
+  geom_col() +
+  facet_wrap(~ city, scales = "free_y") +
+  coord_flip() +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(
+    title = "Top 10 Neighbourhoods by Number of Reviews per City",
+    x = "Neighbourhood",
+    y = "Average Rating",
+    fill = "Total Reviews"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 8),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5)
+  )
+
+
+```
+This visualization helps identify which neighbourhoods attract the most engagement and whether popularity aligns with higher ratings — valuable insights for improving visibility and guest satisfaction
+
+
+
+
+A correlation heatmap is an excellent visual for understanding linear relationships among multiple numerical variables at once. It helps quickly identify which variables move together (positively or negatively).
+
+```{r, echo=FALSE, include=TRUE}
+# Load packages
+library(GGally)
+#Extract num columns
+numeric_data <- data %>%
+  select(where(is.numeric))  
+
+
+ggcorr(
+  numeric_data,
+  method = c("pairwise.complete.obs", "pearson"), # handles missing values
+  label = TRUE,       # show value of correlation
+  label_round = 2,    # 2 decimal rounding
+  label_alpha = TRUE, # transparency 
+  hjust = 0.75,
+  size = 3,
+  layout.exp = 1
+) +
+  scale_fill_gradient2(
+    low = "steelblue",
+    mid = "white",
+    high = "darkred",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  labs(title = "Correlation Map of Airbnb Numerical Variables") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 15))
+
+```
+From this visualization, we can observe strong positive correlations between variables like bedrooms, beds, and baths, which makes sense — larger listings tend to have more rooms and beds.
+Meanwhile, number_of_reviews and reviews_per_month are also highly correlated, indicating that listings with consistent monthly engagement accumulate more total reviews.
+
+
+A faceted horizontal bar chart is a great way to compare the distribution of property types across multiple cities while keeping each city’s scale independent for better visibility.
+```{r, echo=FALSE, include=TRUE}
+ggplot(data, aes(x = property_type, fill = property_type)) +
+  geom_bar() +
+  facet_wrap(~ city, scales = "free_x") +
+  coord_flip()+
+  labs(
+    title = "Distribution of Property Types by City",
+    x = "Property Type",
+    y = "Number of Listings"
+  ) +
+  theme_minimal() 
+```
+This visualization helps identify patterns in Airbnb market composition — for instance, London’s dominance in rental units, or homes being the most common type in smaller cities like Manchester. Each facet provides localized insight while maintaining comparability.
+
+
+The matching version for room types.
+
+```{r, echo=FALSE, include=TRUE}
+ggplot(data, aes(x = room_type, fill = room_type)) +
+  geom_bar() +
+  facet_wrap(~ city, scales = "free_x") +
+  coord_flip()+
+  labs(
+    title = "Distribution of Room Types by City",
+    x = "Room Type",
+    y = "Number of Listings"
+  ) +
+  theme_minimal() 
+```
+This visualization reveals how room availability differs by city. For example, *Entire home/apartment* listings dominate across most cities, suggesting that hosts often rent full spaces rather than shared rooms. Manchester’s large `NA` category highlights missing *room_type* data that may require further investigation.
+
+The following visualization shows how ratings vary by room type and city. Boxplots are chosen here as they effectively represent the spread, median, and outliers in rating distributions for each room category.
+
+```{r, echo=FALSE, include=TRUE, message=FALSE, warning=FALSE}
+library(ggplot2)
+
+ggplot(data, aes(x = room_type, y = rating, fill = city)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = 16, outlier.size = 1.5) +
+  labs(
+    title = "Distribution of Ratings by Room Type and City",
+    x = "Room Type",
+    y = "Rating"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 15),
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.title = element_blank()
+  )
+
+```
+From this chart, we can observe that Private rooms and Entire homes/apartments generally achieve consistently high ratings (above 4.5) across all cities.
+Meanwhile, Hotel rooms tend to have more variability, possibly due to differing service expectations and guest experiences.
+
+##### b.With the goal being improving the number of reviews left by customers, what are the exploratory questions you would ask about this data set? List at least three such questions and provide answers to each of those questions by coding solutions in R Assessment Notebook.
+
+**Question: Does the minimum stay requirement influence the number of reviews?**
+
+Guests might prefer listings that allow shorter stays, leading to more frequent bookings and potentially more reviews. This question helps determine whether flexible stay policies can help hosts increase engagement.
+
+
+```{r, message=FALSE, warning=FALSE}
+
+ggplot(data, aes(x = minimum_nights, y = number_of_reviews)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  scale_x_continuous(
+    limits = c(0, 10),
+    breaks = seq(0, 10, by = 1)  
+  ) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  labs(
+    title = "Relationship between Minimum Nights and Number of Reviews",
+    x = "Minimum Nights Required",
+    y = "Number of Reviews"
+  ) +
+  theme_minimal()
+
+```
+
+The plot clearly shows that listings with shorter minimum-night requirements (especially 1–2 nights) tend to have significantly more reviews. As the required stay increases, the number of reviews drops sharply. This supports the idea that flexible booking policies attract more guests and increase review frequency.
+
+**Question: Does the price-to-bed ratio affect the number of reviews?**
+
+Pricing strategy can directly influence guest decisions. This question investigates whether listings offering better value (lower price per bed) tend to receive more reviews.
+
+```{r, message=FALSE}
+ggplot(data, aes(x = price_to_beds, y = number_of_reviews)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  scale_x_continuous(limits = c(0, 500)) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  labs(
+    title = "Effect of Price per Bed on Number of Reviews",
+    x = "Price per Bed (£)",
+    y = "Number of Reviews"
+  ) +
+  theme_minimal()
+
+```
+The scatterplot shows that as the price per bed increases, the number of reviews tends to decrease. Listings that offer lower prices per bed attract more guests, resulting in a higher review count. This pattern suggests that affordability plays a crucial role in driving guest engagement and feedback frequency.
+
+**Question: Does the rating influence the number of reviews?**
+
+A higher rating could indicate a better guest experience, which may encourage more bookings and consequently more reviews. This question explores whether highly rated listings receive more engagement from guests.
+```{r, message=FALSE, warning=FALSE}
+ggplot(data, aes(x = rating, y = number_of_reviews, color = city)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(
+    title = "Relationship between Rating and Number of Reviews",
+    x = "Average Rating",
+    y = "Number of Reviews"
+  ) +
+  theme_minimal()
+
+```
+The scatterplot reveals that listings with higher ratings (4.5–5 stars) tend to accumulate more reviews, particularly in cities like London and Edinburgh. This suggests that maintaining a strong reputation through quality service and guest satisfaction plays a key role in driving engagement. However, the correlation is not perfectly linear—some highly rated listings still receive few reviews, indicating that visibility and location may also influence review volume.
+
+**Question: Are certain types of properties receiving more reviews?**
+
+Different property types might appeal to different traveler demographics, affecting guest volume and review frequency. Here, we examine which property types attract the most engagement.
+
+```{r}
+data %>%
+  group_by(property_type) %>%
+  summarise(avg_reviews = mean(number_of_reviews, na.rm = TRUE)) %>%
+  arrange(desc(avg_reviews)) %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(property_type, avg_reviews), y = avg_reviews, fill = property_type)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Top Property Types by Average Number of Reviews",
+    x = "Property Type",
+    y = "Average Number of Reviews"
+  ) +
+  theme_minimal()
+
+```
+The results show that townhouses, lofts, and guesthouses tend to have the highest average number of reviews. These property types may provide a more distinctive or memorable guest experience, encouraging feedback. Meanwhile, serviced apartments and standard homes receive fewer reviews, possibly due to being more conventional or less unique.
+This suggests that offering more character or personalized touches in a property could help increase guest engagement and review activity.
+
+### Question 3  Summarise your findings in R Assessment Notebook.
+
+#### Write a short set of recommendations you would give to a new Airbnb host based on your entire analysis.
+
+Based on the analysis conducted, several insights can guide new Airbnb hosts toward improving their listing performance and increasing guest engagement:  
+
+1. **Focus on Competitive Pricing:**  
+   Listings with lower price-per-bed ratios generally receive more reviews. New hosts should research local pricing trends and set competitive, yet fair, rates to attract more bookings and reviews.  
+
+2. **Keep Minimum Night Requirements Flexible:**  
+   The analysis showed that properties with fewer minimum nights required tend to receive more reviews. Allowing shorter stays may increase occupancy and overall visibility on the platform.  
+
+3. **Maintain High Ratings Through Quality and Service:**  
+   Properties with higher average ratings consistently receive more reviews. This indicates that providing excellent guest experiences — including cleanliness, clear communication, and accurate listings — encourages guests to leave positive feedback.  
+
+4. **Offer Unique or Distinctive Spaces:**  
+   Townhouses, lofts, and guesthouses tend to receive the most reviews on average. These property types likely appeal to guests seeking unique experiences. Even within standard homes, adding distinctive touches (e.g., decor, amenities, or local character) can help differentiate the listing.  
+
+5. **Promote Listings in High-Engagement Areas:**  
+   Certain neighbourhoods show stronger activity in both reviews and ratings. Understanding which areas perform best can help hosts better target their marketing or pricing strategies to attract consistent bookings.  
+
+6. **Encourage Reviews Proactively:**  
+   After check-out, hosts should follow up with guests politely to request feedback. Timely and courteous review reminders can significantly increase review counts.  
+
+In summary, a new Airbnb host should prioritize affordability, guest satisfaction, and listing distinctiveness. Combining these strategies not only boosts visibility in search results but also fosters long-term success through repeat bookings and strong guest reputation.
+
+### b. Key Graphs Related to Reviews  
+
+The following three visualizations best capture insights about the number of reviews and the factors influencing them. Each chart highlights how certain aspects such as pricing, minimum stay requirements, and property types impact guest engagement.
+
+1. **Relationship Between Minimum Nights and Number of Reviews**
+  This scatter plot shows that listings with shorter minimum stay requirements tend to receive more reviews.
+Flexibility encourages more frequent bookings, increasing opportunities for feedback.
+
+```{r, echo=FALSE, include=TRUE}
+
+ggplot(data, aes(x = minimum_nights, y = number_of_reviews)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  scale_x_continuous(
+    limits = c(0, 10),
+    breaks = seq(0, 10, by = 1)  
+  ) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  labs(
+    title = "Relationship between Minimum Nights and Number of Reviews",
+    x = "Minimum Nights Required",
+    y = "Number of Reviews"
+  ) +
+  theme_minimal()
+
+```
+
+2. **Effect of Price per Bed on Number of Reviews**
+  This visualization demonstrates that more affordable listings tend to receive more reviews.
+Lower price-per-bed ratios make listings more accessible to a wider audience, increasing both bookings and reviews.
+
+```{r,echo=FALSE, include=TRUE}
+ggplot(data, aes(x = price_to_beds, y = number_of_reviews)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  scale_x_continuous(limits = c(0, 500)) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  labs(
+    title = "Effect of Price per Bed on Number of Reviews",
+    x = "Price per Bed (£)",
+    y = "Number of Reviews"
+  ) +
+  theme_minimal()
+
+```
+3. **Top Property Types by Average Number of Reviews**
+  This bar chart highlights which property types receive the most reviews on average.
+Unique or appealing listings such as townhouses and lofts stand out for higher engagement, suggesting guests are more likely to leave reviews for these properties.
+```{r, echo=FALSE, include=TRUE}
+data %>%
+  group_by(property_type) %>%
+  summarise(avg_reviews = mean(number_of_reviews, na.rm = TRUE)) %>%
+  arrange(desc(avg_reviews)) %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(property_type, avg_reviews), y = avg_reviews, fill = property_type)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Top Property Types by Average Number of Reviews",
+    x = "Property Type",
+    y = "Average Number of Reviews"
+  ) +
+  theme_minimal()
+
+```
